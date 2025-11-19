@@ -24,28 +24,6 @@ from sam2.utils.misc import concat_points
 from training.utils.data_utils import BatchedVideoDatapoint, BatchedVideoMetaData
 
 
-def dice_loss(
-        inputs: torch.Tensor,
-        targets: torch.Tensor,
-        num_masks: float,
-    ):
-    """
-    Compute the DICE loss, similar to generalized IOU for masks
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                (0 for the negative class and 1 for the positive class).
-    """
-    inputs, targets = inputs.flatten(1), targets.flatten(1)
-    inputs = inputs.sigmoid()
-    numerator = 2 * (inputs * targets).sum(-1)
-    denominator = inputs.sum(-1) + targets.sum(-1)
-    loss = 1 - (numerator + 1) / (denominator + 1)
-    return loss.sum() / num_masks
-
-
 class SAM2Train(SAM2Base):
     def __init__(
         self,
@@ -148,17 +126,7 @@ class SAM2Train(SAM2Base):
         backbone_out = self.prepare_prompt_inputs(backbone_out, query_input, (query_pseudo_mask > 0))
         previous_stages_out = self.forward_tracking(backbone_out, query_input)
 
-        # loss on the first frame
-        coarse_loss = self._compute_objective(query_pseudo_mask.squeeze(1), query_input.masks[:1, ...].squeeze(0))
-
-        return previous_stages_out, query_input.masks, coarse_loss
-
-    def _compute_objective(self, logit_mask, gt_mask):
-        """ BCE + Dice loss"""
-        bsz = logit_mask.size(0)
-        loss_bce = self.bce_with_logits_loss(logit_mask.squeeze(1), gt_mask.float())
-        loss_dice = dice_loss(logit_mask, gt_mask, bsz)
-        return loss_bce + loss_dice
+        return previous_stages_out, query_input.masks
 
     def _support_memory_encoder(self, support_input: BatchedVideoDatapoint):
         """
