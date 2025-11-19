@@ -51,6 +51,31 @@ Note:
 
 Please see [`INSTALL.md`](./INSTALL.md) for FAQs on potential issues and solutions.
 
+## Training
+
+To train the model, run:
+
+```
+d:
+cd D:\Code\work\ioctVideo\BaseSAM2
+conda activate basesam
+wsl -d Ubuntu
+conda activate sam2
+pip install -e .
+pip install -e ".[notebooks]"
+pip install -e ".[dev]"
+
+CUDA_VISIBLE_DEVICES=0 python training/train.py --config configs/sam2.1_training/sam2.1_hiera_s_ioct
+```
+
+## Evaluation
+
+Download the pretrained weights from [sam2.1_hiera_s_endo18](https://drive.google.com/file/d/1DyrrLKst1ZQwkgKM7BWCCwLxSXAgOcMI/view?usp=drive_link). Place the file at `project_root/checkpoints/sam2.1_hiera_s_endo18.pth`.
+
+```
+python tools/vos_inference.py --sam2_cfg configs/sam2.1/sam2.1_hiera_s.yaml --sam2_checkpoint ./sam2_logs/configs/sam2.1_training/sam2.1_hiera_s_ioct/checkpoints/checkpoint_5.pt --output_mask_dir ./results/sam2.1/ioct_fully --support_dir ../data/SUP --base_video_dir ../data/iOCT_lSNR/test/JPEGImages --gt_root ../data/iOCT_lSNR/test/Annotations --gpu_id 0
+```
+
 ## Getting Started
 
 ### Download Checkpoints

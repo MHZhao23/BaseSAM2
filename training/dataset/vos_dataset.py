@@ -56,9 +56,13 @@ class VOSDataset(VisionDataset):
                     idx = idx.item()
                 # sample a video
                 video, segment_loader = self.video_dataset.get_video(idx)
+                sup_video, sup_segment_loader = self.video_dataset.get_support_video(idx)
                 # sample frames and object indices to be used in a datapoint
                 sampled_frms_and_objs = self.sampler.sample(
                     video, segment_loader, epoch=self.curr_epoch
+                )
+                sup_sampled_frms_and_objs = self.sampler.sample_sup(
+                    sup_video, sup_segment_loader, sampled_frms_and_objs.object_ids
                 )
                 break  # Succesfully loaded video
             except Exception as e:
@@ -71,19 +75,61 @@ class VOSDataset(VisionDataset):
                     # Shouldn't fail to load a val video
                     raise e
 
-        datapoint = self.construct(video, sampled_frms_and_objs, segment_loader)
+        datapoint = self.construct(video, sampled_frms_and_objs, segment_loader, sup_sampled_frms_and_objs, sup_segment_loader)
         for transform in self._transforms:
             datapoint = transform(datapoint, epoch=self.curr_epoch)
         return datapoint
 
-    def construct(self, video, sampled_frms_and_objs, segment_loader):
+    def construct(self, video, sampled_frms_and_objs, segment_loader, sup_sampled_frms_and_objs, sup_segment_loader):
         """
         Constructs a VideoDatapoint sample to pass to transforms
         """
+        images = []
+        sup_sampled_frames = sup_sampled_frms_and_objs.frames
+        sup_sampled_object_ids = sup_sampled_frms_and_objs.object_ids
+
+        sup_rgb_images = load_image(sup_sampled_frames)
+        # Iterate over the sampled frames and store their rgb data and object data (bbox, segment)
+        # for frame_idx, frame in enumerate(sup_sampled_frames):
+        w, h = sup_rgb_images.size
+        images.append(
+            Frame(
+                data=sup_rgb_images,
+                objects=[],
+            )
+        )
+        # We load the gt segments associated with the current frame
+        if isinstance(sup_segment_loader, JSONSegmentLoader):
+            sup_segments = sup_segment_loader.load(
+                sup_sampled_frames.frame_idx, obj_ids=sup_sampled_object_ids
+            )
+        else:
+            sup_segments = sup_segment_loader.load(sup_sampled_frames.frame_idx)
+        for obj_id in sup_sampled_object_ids:
+            # Extract the segment
+            if obj_id in sup_segments:
+                assert (
+                    sup_segments[obj_id] is not None
+                ), "None targets are not supported"
+                # segment is uint8 and remains uint8 throughout the transforms
+                sup_segment = sup_segments[obj_id].to(torch.uint8)
+            else:
+                # There is no target, we either use a zero mask target or drop this object
+                if not self.always_target:
+                    continue
+                sup_segment = torch.zeros(h, w, dtype=torch.uint8)
+
+            images[-1].objects.append(
+                Object(
+                    object_id=obj_id,
+                    frame_index=sup_sampled_frames.frame_idx,
+                    segment=sup_segment,
+                )
+            )
+
         sampled_frames = sampled_frms_and_objs.frames
         sampled_object_ids = sampled_frms_and_objs.object_ids
 
-        images = []
         rgb_images = load_images(sampled_frames)
         # Iterate over the sampled frames and store their rgb data and object data (bbox, segment)
         for frame_idx, frame in enumerate(sampled_frames):
@@ -115,7 +161,7 @@ class VOSDataset(VisionDataset):
                         continue
                     segment = torch.zeros(h, w, dtype=torch.uint8)
 
-                images[frame_idx].objects.append(
+                images[-1].objects.append(
                     Object(
                         object_id=obj_id,
                         frame_index=frame.frame_idx,
@@ -133,6 +179,20 @@ class VOSDataset(VisionDataset):
 
     def __len__(self):
         return len(self.video_dataset)
+
+
+def load_image(frame):
+    if frame.data is None:
+        # Load the frame rgb data from file
+        path = frame.image_path
+        with g_pathmgr.open(path, "rb") as fopen:
+            image = PILImage.open(fopen).convert("RGB")
+    else:
+        # The frame rgb data has already been loaded
+        # Convert it to a PILImage
+        image = tensor_2_PIL(frame.data)
+
+    return image
 
 
 def load_images(frames):

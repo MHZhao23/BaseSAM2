@@ -9,6 +9,8 @@ import logging
 import numpy as np
 import torch
 import torch.distributed
+import torch.nn as nn
+import torch.nn.functional as F
 from sam2.modeling.sam2_base import SAM2Base
 from sam2.modeling.sam2_utils import (
     get_1d_sine_pe,
@@ -19,7 +21,29 @@ from sam2.modeling.sam2_utils import (
 
 from sam2.utils.misc import concat_points
 
-from training.utils.data_utils import BatchedVideoDatapoint
+from training.utils.data_utils import BatchedVideoDatapoint, BatchedVideoMetaData
+
+
+def dice_loss(
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        num_masks: float,
+    ):
+    """
+    Compute the DICE loss, similar to generalized IOU for masks
+    Args:
+        inputs: A float tensor of arbitrary shape.
+                The predictions for each example.
+        targets: A float tensor with the same shape as inputs. Stores the binary
+                 classification label for each element in inputs
+                (0 for the negative class and 1 for the positive class).
+    """
+    inputs, targets = inputs.flatten(1), targets.flatten(1)
+    inputs = inputs.sigmoid()
+    numerator = 2 * (inputs * targets).sum(-1)
+    denominator = inputs.sum(-1) + targets.sum(-1)
+    loss = 1 - (numerator + 1) / (denominator + 1)
+    return loss.sum() / num_masks
 
 
 class SAM2Train(SAM2Base):
@@ -100,21 +124,134 @@ class SAM2Train(SAM2Base):
         # A random number generator with a fixed initial seed across GPUs
         self.rng = np.random.default_rng(seed=42)
 
+        # loss functions
+        self.cross_entropy_loss = nn.CrossEntropyLoss()
+        self.bce_with_logits_loss = nn.BCEWithLogitsLoss()
+ 
         if freeze_image_encoder:
             for p in self.image_encoder.parameters():
                 p.requires_grad = False
 
     def forward(self, input: BatchedVideoDatapoint):
+        support_input, query_input = split_support(input)
+
+        # Generate embedded memory for support
+        current_out = self._support_memory_encoder(support_input)
+        query_pseudo_mask = self._generate_query_mask(query_input, current_out)
+
         if self.training or not self.forward_backbone_per_frame_for_eval:
             # precompute image features on all frames before tracking
-            backbone_out = self.forward_image(input.flat_img_batch)
+            backbone_out = self.forward_image(query_input.flat_img_batch)
         else:
             # defer image feature computation on a frame until it's being tracked
             backbone_out = {"backbone_fpn": None, "vision_pos_enc": None}
-        backbone_out = self.prepare_prompt_inputs(backbone_out, input)
-        previous_stages_out = self.forward_tracking(backbone_out, input)
+        backbone_out = self.prepare_prompt_inputs(backbone_out, query_input, (query_pseudo_mask > 0))
+        previous_stages_out = self.forward_tracking(backbone_out, query_input)
 
-        return previous_stages_out
+        # loss on the first frame
+        coarse_loss = self._compute_objective(query_pseudo_mask.squeeze(1), query_input.masks[:1, ...].squeeze(0))
+
+        return previous_stages_out, query_input.masks, coarse_loss
+
+    def _compute_objective(self, logit_mask, gt_mask):
+        """ BCE + Dice loss"""
+        bsz = logit_mask.size(0)
+        loss_bce = self.bce_with_logits_loss(logit_mask.squeeze(1), gt_mask.float())
+        loss_dice = dice_loss(logit_mask, gt_mask, bsz)
+        return loss_bce + loss_dice
+
+    def _support_memory_encoder(self, support_input: BatchedVideoDatapoint):
+        """
+        Generate pseudo masks using support images
+        """
+        # 1. image encoder
+        support_imgs = support_input.img_batch[:1, ...].squeeze(0)
+        index = support_input.flat_obj_to_img_idx[:1, ...].squeeze(0).long()
+        support_imgs = support_imgs[index, :, :, :]
+
+        support_backbone_out = self.forward_image(support_imgs)
+        pix_feat = support_backbone_out["backbone_fpn"][-1].clone()
+
+        # 2. memory encoder for each class (for support img, using features and masks)
+        mask_inputs = support_input.masks.clone()
+        assert mask_inputs.shape[-2:] == (self.image_size, self.image_size), f"mask size must be {self.image_size}x{self.image_size}"
+        mask_inputs = mask_inputs.transpose(0,1)
+        # 12 means 3 classes 1st video + 3 classes 2nd video + 3 classes 3rd video + 3 classes 4th video
+
+        # turn GT binary mask into output logits mask without using SAM2 (for support)
+        high_res_masks = mask_inputs.float() * self.sigmoid_scale_for_mem_enc + self.sigmoid_bias_for_mem_enc
+        maskmem_out = self.memory_encoder(
+            pix_feat, high_res_masks, skip_mask_sigmoid=True
+        )
+
+        current_out = {}
+        current_out.setdefault("mask_inputs", mask_inputs)
+        current_out.setdefault("maskmem_features", [maskmem_out["vision_features"].clone()])
+        current_out.setdefault("maskmem_pos_enc", [m.clone() for m in maskmem_out["vision_pos_enc"]])
+
+        return current_out
+
+    def _generate_query_mask(self, query_input: BatchedVideoDatapoint, prev_out: dict):
+        """
+        Generate pseudo masks for the first query frame in each sequence
+        """
+        Tq = query_input.batch_size[0]
+        B = query_input.img_batch.shape[1]
+
+        # 1. image encoder for only the first frame
+        imgs = query_input.img_batch[:1, ...].squeeze(0)
+        index = (query_input.flat_obj_to_img_idx[:1, ...] // Tq).squeeze(0).long()
+        imgs = imgs[index, :, :, :]
+
+        backbone_out = self.forward_image(imgs)
+        feature_maps = backbone_out["backbone_fpn"][-self.num_feature_levels :]
+        vision_pos_embeds = backbone_out["vision_pos_enc"][-self.num_feature_levels :]
+        high_res_features = feature_maps[:-1]
+        pix_feat = feature_maps[-1]
+
+        # 2. memory attention
+        to_cat_memory = [maskmem.flatten(2).permute(2, 0, 1) for maskmem in prev_out["maskmem_features"]]
+        to_cat_memory_pos_embed = [maskmem.flatten(2).permute(2, 0, 1) for maskmem in prev_out["maskmem_pos_enc"]]
+        memory = torch.cat(to_cat_memory, dim=0)
+        memory_pos_embed = torch.cat(to_cat_memory_pos_embed, dim=0)
+        pix_feat_with_mem = self.memory_attention(
+            curr=feature_maps[-1].flatten(2).permute(2, 0, 1),
+            curr_pos=vision_pos_embeds[-1].flatten(2).permute(2, 0, 1),
+            memory=memory,
+            memory_pos=memory_pos_embed,
+            num_obj_ptr_tokens=0,
+            )
+        pix_feat_with_mem = pix_feat_with_mem.clone()
+        pix_feat_with_mem = pix_feat_with_mem.permute(1, 2, 0).view(*pix_feat.shape)
+            
+        # 3. prompt encoder
+        sam_point_coords = torch.zeros(B, 1, 2, device=self.device)
+        sam_point_labels = - torch.ones(B, 1, dtype=torch.int32, device=self.device)
+        sparse_embeddings, dense_embeddings = self.sam_prompt_encoder(
+            points=(sam_point_coords, sam_point_labels),
+            boxes=None,
+            masks=None,
+        )
+        # clone to help torch.compile
+        sparse_embeddings = sparse_embeddings[index, :, :].clone()
+        dense_embeddings = dense_embeddings[index, :, :, :].clone()
+        image_pe = self.sam_prompt_encoder.get_dense_pe().clone()
+        
+        # 5. mask decoder
+        low_res_multimasks, _, _, _ = self.sam_mask_decoder(
+            image_embeddings=pix_feat_with_mem,
+            image_pe=image_pe,
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=False,
+            repeat_image=False,
+            high_res_features=high_res_features,
+        )
+
+        low_res_multimasks = low_res_multimasks.float()
+        high_res_masks = F.interpolate(low_res_multimasks, size=(self.image_size, self.image_size), mode='bilinear', align_corners=False)
+
+        return high_res_masks
 
     def _prepare_backbone_features_per_frame(self, img_batch, img_ids):
         """Compute the image backbone features on the fly for the given img_ids."""
@@ -143,7 +280,7 @@ class SAM2Train(SAM2Base):
 
         return image, vision_feats, vision_pos_embeds, feat_sizes
 
-    def prepare_prompt_inputs(self, backbone_out, input, start_frame_idx=0):
+    def prepare_prompt_inputs(self, backbone_out, input, query_pseudo_mask, start_frame_idx=0):
         """
         Prepare input mask, point or box prompts. Optionally, we allow tracking from
         a custom `start_frame_idx` to the end of the video (for evaluation purposes).
@@ -223,19 +360,19 @@ class SAM2Train(SAM2Base):
         backbone_out["point_inputs_per_frame"] = {}  # {frame_idx: <input_points>}
         for t in init_cond_frames:
             if not use_pt_input:
-                backbone_out["mask_inputs_per_frame"][t] = gt_masks_per_frame[t]
+                backbone_out["mask_inputs_per_frame"][t] = query_pseudo_mask
             else:
                 # During training # P(box) = prob_to_use_pt_input * prob_to_use_box_input
                 use_box_input = self.rng.random() < prob_to_use_box_input
                 if use_box_input:
                     points, labels = sample_box_points(
-                        gt_masks_per_frame[t],
+                        query_pseudo_mask,
                     )
                 else:
                     # (here we only sample **one initial point** on initial conditioning frames from the
                     # ground-truth mask; we may sample more correction points on the fly)
                     points, labels = get_next_point(
-                        gt_masks=gt_masks_per_frame[t],
+                        gt_masks=query_pseudo_mask,
                         pred_masks=None,
                         method=(
                             "uniform" if self.training else self.pt_sampling_for_eval
@@ -539,3 +676,61 @@ class SAM2Train(SAM2Base):
         current_out["multistep_object_score_logits"] = all_object_score_logits
 
         return point_inputs, sam_outputs
+
+
+def split_support(input: BatchedVideoDatapoint):
+    """
+    Split a BatchedVideoDatapoint into:
+      - support_input: first frame (T=1)
+      - query_input: remaining frames with frame indices renumbered to start at 0
+    """
+
+    # slices
+    sup = slice(0, 1)
+    qry = slice(1, None)
+
+    # --- support tensors ---
+    support_img  = input.img_batch[sup]          # [1, B, C, H, W]
+    support_obj  = input.obj_to_frame_idx[sup]   # [1, O, 2]
+    support_mask = input.masks[sup]              # [1, O, H, W]
+    support_meta = BatchedVideoMetaData(
+        unique_objects_identifier=input.metadata.unique_objects_identifier[sup],
+        frame_orig_size=input.metadata.frame_orig_size[sup],
+    )
+    support_input = BatchedVideoDatapoint(
+        img_batch=support_img,
+        obj_to_frame_idx=support_obj,
+        masks=support_mask,
+        metadata=support_meta,
+        dict_key=input.dict_key,
+        batch_size=[1],
+    )
+
+    # --- query tensors ---
+    query_img  = input.img_batch[qry]            # [Tq, B, C, H, W]
+    query_obj  = input.obj_to_frame_idx[qry].clone()
+    query_mask = input.masks[qry]                # [Tq, O, H, W]
+    query_meta = BatchedVideoMetaData(
+        unique_objects_identifier=input.metadata.unique_objects_identifier[qry].clone(),
+        frame_orig_size=input.metadata.frame_orig_size[qry],
+    )
+
+    # renumber frame indices: 1.. → 0..
+    # obj_to_frame_idx[..., 0] is the frame index
+    query_obj[..., 0] -= 1
+    query_obj = query_obj.to(torch.int32)
+
+    # metadata frame id is the 3rd value (video_id, obj_id, frame_id)
+    query_meta.unique_objects_identifier[..., 2] -= 1
+    query_meta.unique_objects_identifier = query_meta.unique_objects_identifier.to(torch.long)
+
+    query_input = BatchedVideoDatapoint(
+        img_batch=query_img,
+        obj_to_frame_idx=query_obj,
+        masks=query_mask,
+        metadata=query_meta,
+        dict_key=input.dict_key,
+        batch_size=[query_img.shape[0]],  # Tq
+    )
+
+    return support_input, query_input

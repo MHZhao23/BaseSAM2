@@ -454,9 +454,8 @@ class Trainer:
         phase: str,
     ):
 
-        outputs = model(batch)
-        targets = batch.masks
-        batch_size = len(batch.img_batch)
+        outputs, targets, coarse_loss = model(batch)
+        batch_size = len(targets)
 
         key = batch.dict_key  # key for dataset
         loss = self.loss[key](outputs, targets)
@@ -474,6 +473,7 @@ class Trainer:
                 loss, loss_log_str, self.steps[phase]
             )
 
+        loss += 5 * coarse_loss
         if self.steps[phase] % self.logging_conf.log_scalar_frequency == 0:
             self.logger.log(
                 loss_log_str,

@@ -10,9 +10,11 @@ from collections import OrderedDict
 import torch
 import torch.nn.functional as F
 
+import time
 from tqdm import tqdm
 
 from sam2.modeling.sam2_base import NO_OBJ_SCORE, SAM2Base
+from sam2.modeling.sam2_utils import get_next_point
 from sam2.utils.misc import concat_points, fill_holes_in_mask_scores, load_video_frames
 
 
@@ -42,6 +44,7 @@ class SAM2VideoPredictor(SAM2Base):
     def init_state(
         self,
         video_path,
+        support_path,
         offload_video_to_cpu=False,
         offload_state_to_cpu=False,
         async_loading_frames=False,
@@ -55,8 +58,16 @@ class SAM2VideoPredictor(SAM2Base):
             async_loading_frames=async_loading_frames,
             compute_device=compute_device,
         )
+        support_images, _, _ = load_video_frames(
+            video_path=support_path,
+            image_size=self.image_size,
+            offload_video_to_cpu=offload_video_to_cpu,
+            async_loading_frames=async_loading_frames,
+            compute_device=compute_device,
+        )
         inference_state = {}
         inference_state["images"] = images
+        inference_state["support_images"] = support_images
         inference_state["num_frames"] = len(images)
         # whether to offload the video frames to CPU memory
         # turning on this option saves the GPU memory with only a very small overhead
@@ -380,6 +391,243 @@ class SAM2VideoPredictor(SAM2Base):
         )
         return frame_idx, obj_ids, video_res_masks
 
+    @torch.inference_mode()
+    def add_sup_mask(
+        self,
+        inference_state,
+        frame_idx,
+        sup_frame_idx,
+        obj_id,
+        sup_mask,
+    ):
+        """Add sup mask to a frame."""
+        obj_idx = self._obj_id_to_idx(inference_state, obj_id)
+        point_inputs_per_frame = inference_state["point_inputs_per_obj"][obj_idx]
+        mask_inputs_per_frame = inference_state["mask_inputs_per_obj"][obj_idx]
+
+        if not isinstance(sup_mask, torch.Tensor):
+            sup_mask = torch.tensor(sup_mask, dtype=torch.bool)
+        assert sup_mask.dim() == 2
+        mask_H, mask_W = sup_mask.shape
+        sup_mask_inputs_orig = sup_mask[None, None]  # add batch and channel dimension
+        sup_mask_inputs_orig = sup_mask_inputs_orig.float().to(inference_state["device"])
+
+        # resize the mask if it doesn't match the model's image size
+        if mask_H != self.image_size or mask_W != self.image_size:
+            sup_mask_inputs = torch.nn.functional.interpolate(
+                sup_mask_inputs_orig,
+                size=(self.image_size, self.image_size),
+                align_corners=False,
+                mode="bilinear",
+                antialias=True,  # use antialias for downsampling
+            )
+            sup_mask_inputs = (sup_mask_inputs >= 0.5).float()
+        else:
+            sup_mask_inputs = sup_mask_inputs_orig
+
+        """Generate pseudo mask"""
+        mask_inputs = self._get_pseudo_mask(inference_state, sup_mask_inputs, sup_frame_idx, frame_idx, batch_size=1)
+
+        mask_inputs_per_frame[frame_idx] = mask_inputs
+        point_inputs_per_frame.pop(frame_idx, None)
+        # If this frame hasn't been tracked before, we treat it as an initial conditioning
+        # frame, meaning that the inputs points are to generate segments on this frame without
+        # using any memory from other frames, like in SAM. Otherwise (if it has been tracked),
+        # the input points will be used to correct the already tracked masks.
+        obj_frames_tracked = inference_state["frames_tracked_per_obj"][obj_idx]
+        is_init_cond_frame = frame_idx not in obj_frames_tracked
+        # whether to track in reverse time order
+        if is_init_cond_frame:
+            reverse = False
+        else:
+            reverse = obj_frames_tracked[frame_idx]["reverse"]
+        obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
+        obj_temp_output_dict = inference_state["temp_output_dict_per_obj"][obj_idx]
+        # Add a frame to conditioning output if it's an initial conditioning frame or
+        # if the model sees all frames receiving clicks/mask as conditioning frames.
+        is_cond = is_init_cond_frame or self.add_all_frames_to_correct_as_cond
+        storage_key = "cond_frame_outputs" if is_cond else "non_cond_frame_outputs"
+
+        current_out, _ = self._run_single_frame_inference(
+            inference_state=inference_state,
+            output_dict=obj_output_dict,  # run on the slice of a single object
+            frame_idx=frame_idx,
+            batch_size=1,  # run on the slice of a single object
+            is_init_cond_frame=is_init_cond_frame,
+            point_inputs=None,
+            mask_inputs=mask_inputs,
+            reverse=reverse,
+            # Skip the memory encoder when adding clicks or mask. We execute the memory encoder
+            # at the beginning of `propagate_in_video` (after user finalize their clicks). This
+            # allows us to enforce non-overlapping constraints on all objects before encoding
+            # them into memory.
+            run_mem_encoder=False,
+        )
+        # Add the output to the output dict (to be used as future memory)
+        obj_temp_output_dict[storage_key][frame_idx] = current_out
+
+        # Resize the output mask to the original video resolution
+        obj_ids = inference_state["obj_ids"]
+        consolidated_out = self._consolidate_temp_output_across_obj(
+            inference_state,
+            frame_idx,
+            is_cond=is_cond,
+            consolidate_at_video_res=True,
+        )
+        _, video_res_masks = self._get_orig_video_res_output(
+            inference_state, consolidated_out["pred_masks_video_res"]
+        )
+        return frame_idx, obj_ids, video_res_masks
+
+    def _get_pseudo_mask(self, inference_state, support_masks, sup_frame_idx, frame_idx, batch_size=1):
+        current_out = self._support_memory_encoder(inference_state, support_masks, sup_frame_idx)
+        mask_inputs = self._generate_query_mask(inference_state, frame_idx, current_out, batch_size=batch_size)
+
+        return mask_inputs
+
+    def _support_memory_encoder(self, inference_state, support_masks, sup_frame_idx):
+        device = inference_state["device"]
+
+        # Get support features
+        support_image = (inference_state["support_images"][sup_frame_idx].to(device).float().unsqueeze(0))
+        support_backbone_out = self.forward_image(support_image)
+        pix_feat = support_backbone_out["backbone_fpn"][-1].clone()
+
+        # 2. memory encoder for each class (for support img, using features and masks)
+        mask_inputs = support_masks.clone()
+        assert mask_inputs.shape[-2:] == (self.image_size, self.image_size), f"mask size must be {self.image_size}x{self.image_size}"
+        mask_inputs = mask_inputs.transpose(0,1)
+        # 12 means 3 classes 1st video + 3 classes 2nd video + 3 classes 3rd video + 3 classes 4th video
+
+        # turn GT binary mask into output logits mask without using SAM2 (for support)
+        high_res_masks = mask_inputs.float() * self.sigmoid_scale_for_mem_enc + self.sigmoid_bias_for_mem_enc
+        maskmem_out = self.memory_encoder(
+            pix_feat, high_res_masks, skip_mask_sigmoid=True
+        )
+
+        current_out = {}
+        current_out.setdefault("mask_inputs", mask_inputs)
+        current_out.setdefault("maskmem_features", [maskmem_out["vision_features"].clone()])
+        current_out.setdefault("maskmem_pos_enc", [m.clone() for m in maskmem_out["vision_pos_enc"]])
+
+        return current_out
+
+    def _generate_query_mask(self, inference_state, frame_idx, prev_out, batch_size=1):
+        """
+        Generate pseudo masks for the first query frame in each sequence
+        """
+        device = inference_state["device"]
+
+        # 1. Get query image features
+        image, backbone_out = inference_state["cached_features"].get(frame_idx, (None, None))
+        if backbone_out is None:
+            image = (inference_state["images"][frame_idx].to(device).float().unsqueeze(0))
+            backbone_out = self.forward_image(image)
+            inference_state["cached_features"] = {frame_idx: (image, backbone_out)}
+
+        feature_maps = backbone_out["backbone_fpn"][-self.num_feature_levels :]
+        vision_pos_embeds = backbone_out["vision_pos_enc"][-self.num_feature_levels :]
+        high_res_features = feature_maps[:-1]
+        pix_feat = feature_maps[-1]
+
+        # 2. memory attention
+        to_cat_memory = [maskmem.flatten(2).permute(2, 0, 1) for maskmem in prev_out["maskmem_features"]]
+        to_cat_memory_pos_embed = [maskmem.flatten(2).permute(2, 0, 1) for maskmem in prev_out["maskmem_pos_enc"]]
+        memory = torch.cat(to_cat_memory, dim=0)
+        memory_pos_embed = torch.cat(to_cat_memory_pos_embed, dim=0)
+        pix_feat_with_mem = self.memory_attention(
+            curr=feature_maps[-1].flatten(2).permute(2, 0, 1),
+            curr_pos=vision_pos_embeds[-1].flatten(2).permute(2, 0, 1),
+            memory=memory,
+            memory_pos=memory_pos_embed,
+            num_obj_ptr_tokens=0,
+            )
+        pix_feat_with_mem = pix_feat_with_mem.clone()
+        pix_feat_with_mem = pix_feat_with_mem.permute(1, 2, 0).view(*pix_feat.shape)
+            
+        # 3. prompt encoder
+        sam_point_coords = torch.zeros(batch_size, 1, 2, device=self.device)
+        sam_point_labels = - torch.ones(batch_size, 1, dtype=torch.int32, device=self.device)
+        sparse_embeddings, dense_embeddings = self.sam_prompt_encoder(
+            points=(sam_point_coords, sam_point_labels),
+            boxes=None,
+            masks=None,
+        )
+        # clone to help torch.compile
+        sparse_embeddings = sparse_embeddings.clone()
+        dense_embeddings = dense_embeddings.clone()
+        image_pe = self.sam_prompt_encoder.get_dense_pe().clone()
+        
+        # 5. mask decoder
+        low_res_multimasks, _, _, _ = self.sam_mask_decoder(
+            image_embeddings=pix_feat_with_mem,
+            image_pe=image_pe,
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=False,
+            repeat_image=False,
+            high_res_features=high_res_features,
+        )
+
+        low_res_multimasks = low_res_multimasks.clone().float()
+        high_res_masks = F.interpolate(low_res_multimasks, size=(self.image_size, self.image_size), mode='bilinear', align_corners=False)
+
+        # # Refine the masks
+        # # 1. memory encoder for query images, using features and masks)
+        # # high_res_masks = (high_res_masks > 0).float() * self.sigmoid_scale_for_mem_enc + self.sigmoid_bias_for_mem_enc
+        # maskmem_out = self.memory_encoder(
+        #     pix_feat, high_res_masks, skip_mask_sigmoid=True
+        # )
+        # current_out = {}
+        # current_out.setdefault("maskmem_features", [maskmem_out["vision_features"].clone()])
+        # current_out.setdefault("maskmem_pos_enc", [m.clone() for m in maskmem_out["vision_pos_enc"]])
+
+        # # 2. memory attention
+        # to_cat_memory = [maskmem.flatten(2).permute(2, 0, 1) for maskmem in current_out["maskmem_features"]]
+        # to_cat_memory_pos_embed = [maskmem.flatten(2).permute(2, 0, 1) for maskmem in current_out["maskmem_pos_enc"]]
+        # memory = torch.cat(to_cat_memory, dim=0)
+        # memory_pos_embed = torch.cat(to_cat_memory_pos_embed, dim=0)
+        # pix_feat_with_mem = self.memory_attention(
+        #     curr=feature_maps[-1].flatten(2).permute(2, 0, 1),
+        #     curr_pos=vision_pos_embeds[-1].flatten(2).permute(2, 0, 1),
+        #     memory=memory,
+        #     memory_pos=memory_pos_embed,
+        #     num_obj_ptr_tokens=0,
+        #     )
+        # pix_feat_with_mem = pix_feat_with_mem.clone()
+        # pix_feat_with_mem = pix_feat_with_mem.permute(1, 2, 0).view(*pix_feat.shape)
+
+        # # 3. prompt encoder
+        # new_points, new_labels = get_next_point(
+        #     gt_masks=(high_res_masks > 0),
+        #     pred_masks=None,
+        #     method="center",
+        # )
+        # point_inputs = concat_points(None, new_points, new_labels)
+        # sam_point_coords = point_inputs["point_coords"]
+        # sam_point_labels = point_inputs["point_labels"]
+        # sparse_embeddings, dense_embeddings = self.sam_prompt_encoder(
+        #     points=(sam_point_coords, sam_point_labels),
+        #     boxes=None,
+        #     masks=None,
+        # )
+        
+        # # 5. mask decoder
+        # low_res_multimasks, _, _, _ = self.sam_mask_decoder(
+        #     image_embeddings=pix_feat_with_mem,
+        #     image_pe=self.sam_prompt_encoder.get_dense_pe(),
+        #     sparse_prompt_embeddings=sparse_embeddings,
+        #     dense_prompt_embeddings=dense_embeddings,
+        #     multimask_output=False,
+        #     repeat_image=False,
+        #     high_res_features=high_res_features,
+        # )
+
+        # low_res_multimasks = low_res_multimasks.clone().float()
+        # high_res_masks = F.interpolate(low_res_multimasks, size=(self.image_size, self.image_size), mode='bilinear', align_corners=False)
+
+        return (high_res_masks > 0)
+
     def _get_orig_video_res_output(self, inference_state, any_res_masks):
         """
         Resize the object scores to the original video resolution (video_res_masks)
@@ -580,8 +828,13 @@ class SAM2VideoPredictor(SAM2Base):
             )
             processing_order = range(start_frame_idx, end_frame_idx + 1)
 
+        middle_processing_time = 0
+        middle_processing_count = 0
         for frame_idx in tqdm(processing_order, desc="propagate in video"):
             pred_masks_per_obj = [None] * batch_size
+            # 计时
+            if batch_size == 1 and frame_idx > 100:
+                start_time = time.time()
             for obj_idx in range(batch_size):
                 obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
                 # We skip those frames already in consolidated outputs (these are frames
@@ -618,6 +871,10 @@ class SAM2VideoPredictor(SAM2Base):
                 }
                 pred_masks_per_obj[obj_idx] = pred_masks
 
+            if batch_size == 1 and frame_idx > 100:
+                end_time = time.time()
+                middle_processing_time += (end_time - start_time)
+                middle_processing_count += 1
             # Resize the output mask to the original video resolution (we directly use
             # the mask scores on GPU for output to avoid any CPU conversion in between)
             if len(pred_masks_per_obj) > 1:
@@ -628,6 +885,9 @@ class SAM2VideoPredictor(SAM2Base):
                 inference_state, all_pred_masks
             )
             yield frame_idx, obj_ids, video_res_masks
+
+        if middle_processing_count > 0:
+            print(f'FPS: {1/(middle_processing_time/middle_processing_count)}')
 
     @torch.inference_mode()
     def clear_all_prompts_in_frame(

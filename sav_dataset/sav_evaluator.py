@@ -75,6 +75,10 @@ parser.add_argument(
     "Set this to true for evaluation on settings that doesn't skip first and last frames",
     action="store_true",
 )
+parser.add_argument(
+    "--evaluate_blank_frame",
+    type=int, default=1
+)
 
 
 if __name__ == "__main__":

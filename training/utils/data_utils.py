@@ -107,6 +107,7 @@ class VideoDatapoint:
     """Refers to an image/video and all its annotations"""
 
     frames: List[Frame]
+    # sup_frame: Tuple[PILImage.Image, torch.Tensor]
     video_id: int
     size: Tuple[int, int]
 

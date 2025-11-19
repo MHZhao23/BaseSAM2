@@ -7,6 +7,8 @@
 import glob
 import logging
 import os
+import random
+from PIL import Image as PILImage
 from dataclasses import dataclass
 
 from typing import List, Optional
@@ -52,6 +54,9 @@ class VOSRawDataset:
     def get_video(self, idx):
         raise NotImplementedError()
 
+    def get_support_video(self, current_idx):
+        raise NotImplementedError()
+
 
 class PNGRawDataset(VOSRawDataset):
     def __init__(
@@ -65,6 +70,8 @@ class PNGRawDataset(VOSRawDataset):
         single_object_mode=False,
         truncate_video=-1,
         frames_sampling_mult=False,
+        used_object_ids=None,
+        mult_ratio=1,
     ):
         self.img_folder = img_folder
         self.gt_folder = gt_folder
@@ -72,6 +79,8 @@ class PNGRawDataset(VOSRawDataset):
         self.is_palette = is_palette
         self.single_object_mode = single_object_mode
         self.truncate_video = truncate_video
+        self.used_object_ids = used_object_ids
+
 
         # Read the subset defined in file_list_txt
         if file_list_txt is not None:
@@ -106,6 +115,7 @@ class PNGRawDataset(VOSRawDataset):
             video_names_mult = []
             for video_name in self.video_names:
                 num_frames = len(os.listdir(os.path.join(self.img_folder, video_name)))
+                num_frames = int(num_frames * mult_ratio)
                 video_names_mult.extend([video_name] * num_frames)
             self.video_names = video_names_mult
 
@@ -125,7 +135,7 @@ class PNGRawDataset(VOSRawDataset):
         video_mask_root = os.path.join(self.gt_folder, video_name)
 
         if self.is_palette:
-            segment_loader = PalettisedPNGSegmentLoader(video_mask_root)
+            segment_loader = PalettisedPNGSegmentLoader(video_mask_root, self.used_object_ids)
         else:
             segment_loader = MultiplePNGSegmentLoader(
                 video_mask_root, self.single_object_mode
@@ -141,6 +151,20 @@ class PNGRawDataset(VOSRawDataset):
             frames.append(VOSFrame(fid, image_path=fpath))
         video = VOSVideo(video_name, idx, frames)
         return video, segment_loader
+
+    def get_support_video(self, current_idx):
+        """
+        Randomly sample one frame (and its corresponding mask) 
+        from a video that is different from the given current_idx.
+        Returns (frame_image, frame_mask, video_name, frame_id).
+        """
+
+        other_indices = [i for i in range(len(self.video_names)) if i != current_idx]
+        if not other_indices:
+            raise ValueError("Dataset only contains one video.")
+        random_idx = random.choice(other_indices)
+
+        return self.get_video(random_idx)
 
     def __len__(self):
         return len(self.video_names)
