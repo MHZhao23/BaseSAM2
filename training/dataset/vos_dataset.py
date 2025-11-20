@@ -84,6 +84,9 @@ class VOSDataset(VisionDataset):
         """
         Constructs a VideoDatapoint sample to pass to transforms
         """
+        valid_frame_id = []
+
+        # -------------- Support frames --------------
         images = []
         sup_sampled_frames = sup_sampled_frms_and_objs.frames
         sup_sampled_object_ids = sup_sampled_frms_and_objs.object_ids
@@ -98,6 +101,7 @@ class VOSDataset(VisionDataset):
                 objects=[],
             )
         )
+        valid_frame_id.append(0)
         # We load the gt segments associated with the current frame
         if isinstance(sup_segment_loader, JSONSegmentLoader):
             sup_segments = sup_segment_loader.load(
@@ -127,6 +131,7 @@ class VOSDataset(VisionDataset):
                 )
             )
 
+        # -------------- query frames --------------
         sampled_frames = sampled_frms_and_objs.frames
         sampled_object_ids = sampled_frms_and_objs.object_ids
 
@@ -147,6 +152,20 @@ class VOSDataset(VisionDataset):
                 )
             else:
                 segments = segment_loader.load(frame.frame_idx)
+            
+            if not segments:
+                # if the current frame doesn't have a mask
+                for obj_id in sampled_object_ids:
+                    images[-1].objects.append(
+                        Object(
+                            object_id=obj_id,
+                            frame_index=frame.frame_idx,
+                            segment=torch.zeros(h, w, dtype=torch.uint8),
+                        )
+                    )
+                continue
+
+            valid_frame_id.append(frame_idx+1)
             for obj_id in sampled_object_ids:
                 # Extract the segment
                 if obj_id in segments:
@@ -170,6 +189,7 @@ class VOSDataset(VisionDataset):
                 )
         return VideoDatapoint(
             frames=images,
+            valid_frame_id=valid_frame_id,
             video_id=video.video_id,
             size=(h, w),
         )

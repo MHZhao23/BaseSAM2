@@ -49,11 +49,17 @@ class RandomUniformSampler(VOSSampler):
                 raise Exception(
                     f"Cannot sample {self.num_frames} frames from video {video.video_name} as it only has {len(video.frames)} annotated frames."
                 )
-            start = random.randrange(0, len(video.frames) - self.num_frames + 1)
-            frames = [video.frames[start + step] for step in range(self.num_frames)]
-            if random.uniform(0, 1) < self.reverse_time_prob:
-                # Reverse time
-                frames = frames[::-1]
+            start = random.choice(video.is_labelled_idx)
+            if (start + self.num_frames) >= len(video.frames):
+                reverse_time = -1
+            elif (start - self.num_frames) < 0:
+                reverse_time = 1
+            else:
+                reverse_time = (-1) * random.randint(1,2)
+            frames = [video.frames[start + step * reverse_time] for step in range(self.num_frames)]
+            # if random.uniform(0, 1) < self.reverse_time_prob:
+            #     # Reverse time
+            #     frames = frames[::-1]
 
             # Get first frame object ids
             visible_object_ids = []
@@ -83,7 +89,7 @@ class RandomUniformSampler(VOSSampler):
     def sample_sup(self, video, segment_loader, object_ids):
 
         for retry in range(MAX_RETRIES):
-            frame_id = random.randrange(0, len(video.frames))
+            frame_id = random.choice(video.is_labelled_idx)
 
             # Get first frame object ids
             visible_object_ids = []

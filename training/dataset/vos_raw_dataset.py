@@ -33,6 +33,7 @@ from training.dataset.vos_segment_loader import (
 class VOSFrame:
     frame_idx: int
     image_path: str
+    is_labelled: bool
     data: Optional[torch.Tensor] = None
     is_conditioning_only: Optional[bool] = False
 
@@ -42,6 +43,7 @@ class VOSVideo:
     video_name: str
     video_id: int
     frames: List[VOSFrame]
+    is_labelled_idx: List[int]
 
     def __len__(self):
         return len(self.frames)
@@ -146,10 +148,14 @@ class PNGRawDataset(VOSRawDataset):
         if self.truncate_video > 0:
             all_frames = all_frames[: self.truncate_video]
         frames = []
-        for _, fpath in enumerate(all_frames[:: self.sample_rate]):
+        is_labelled_idx = []
+        for i, fpath in enumerate(all_frames[:: self.sample_rate]):
             fid = int(os.path.basename(fpath).split(".")[0])
-            frames.append(VOSFrame(fid, image_path=fpath))
-        video = VOSVideo(video_name, idx, frames)
+            mpath = os.path.join(video_mask_root, os.path.basename(fpath))
+            is_labelled = os.path.exists(os.path.join(video_mask_root, os.path.basename(fpath)))
+            frames.append(VOSFrame(fid, image_path=fpath, is_labelled=is_labelled))
+            if is_labelled: is_labelled_idx.append(i)
+        video = VOSVideo(video_name, idx, frames, is_labelled_idx)
         return video, segment_loader
 
     def get_support_video(self, current_idx):

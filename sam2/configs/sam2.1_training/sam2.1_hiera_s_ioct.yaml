@@ -3,13 +3,13 @@
 scratch:
   resolution: 256
   train_batch_size: 4
-  num_train_workers: 0
+  num_train_workers: 8
   num_frames: 8
   max_num_objects: 3
   base_lr: 5.0e-5
   vision_lr: 5.0e-5
   phases_per_epoch: 1
-  num_epochs: 30
+  num_epochs: 10
   freeze_image_encoder: False
 
 launcher:
@@ -19,7 +19,7 @@ launcher:
 
 dataset:
   # PATHS to Dataset
-  img_folder: ../data/Synthetic_iOCT/train/JPEGImages
+  img_folder: ../data/Synthetic_iOCT/train/JPEGImagesAll
   gt_folder: ../data/Synthetic_iOCT/train/Annotations
   file_list_txt: null
   multiplier: 1
@@ -31,11 +31,6 @@ vos:
     - _target_: training.dataset.transforms.ComposeAPI
       transforms:
         - _target_: training.dataset.transforms.RandomHorizontalFlip
-          consistent_transform: True
-        - _target_: training.dataset.transforms.RandomAffine
-          degrees: 25
-          shear: 20
-          image_interpolation: bilinear
           consistent_transform: True
         - _target_: training.dataset.transforms.RandomResizeAPI
           sizes: ${scratch.resolution}

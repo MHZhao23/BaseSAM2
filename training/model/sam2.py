@@ -24,6 +24,38 @@ from sam2.utils.misc import concat_points
 from training.utils.data_utils import BatchedVideoDatapoint, BatchedVideoMetaData
 
 
+def dice_loss(
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        num_masks: float,
+    ):
+    """
+    Compute the DICE loss, similar to generalized IOU for masks
+    Args:
+        inputs: A float tensor of arbitrary shape.
+                The predictions for each example.
+        targets: A float tensor with the same shape as inputs. Stores the binary
+                 classification label for each element in inputs
+                (0 for the negative class and 1 for the positive class).
+    """
+    inputs, targets = inputs.flatten(1), targets.flatten(1)
+    inputs = inputs.sigmoid()
+    numerator = 2 * (inputs * targets).sum(-1)
+    denominator = inputs.sum(-1) + targets.sum(-1)
+    loss = 1 - (numerator + 1) / (denominator + 1)
+    return loss.sum() / num_masks
+
+
+def get_consistency_weight(epoch, consistency=1, rampup_length=5000):
+    if rampup_length == 0:
+        weight = 1.0
+    else:
+        epoch = np.clip(epoch, 0.0, rampup_length)
+        phase = 1.0 - epoch / rampup_length
+        weight = float(np.exp(-5.0 * phase * phase))
+    return consistency * weight
+
+
 class SAM2Train(SAM2Base):
     def __init__(
         self,
@@ -103,7 +135,8 @@ class SAM2Train(SAM2Base):
         self.rng = np.random.default_rng(seed=42)
 
         # loss functions
-        self.cross_entropy_loss = nn.CrossEntropyLoss()
+        self.ep = 0
+        self.mse_loss = nn.MSELoss()
         self.bce_with_logits_loss = nn.BCEWithLogitsLoss()
  
         if freeze_image_encoder:
@@ -113,20 +146,87 @@ class SAM2Train(SAM2Base):
     def forward(self, input: BatchedVideoDatapoint):
         support_input, query_input = split_support(input)
 
+        # get features
+        if self.training or not self.forward_backbone_per_frame_for_eval:
+            backbone_out = self.forward_image(query_input.flat_img_batch)
+        else:
+            backbone_out = {"backbone_fpn": None, "vision_pos_enc": None}
+
+        # propagate with real masks
+        with torch.no_grad():
+            previous_stages_out_real = self._real_forward(query_input, backbone_out)
+
+        # propagate with pseudo masks
+        previous_stages_out_pseudo, query_pseudo_mask = self._pseudo_forward(support_input, query_input, backbone_out)
+
+        # loss on the first frame
+        coarse_loss = self._compute_coarse_loss(query_pseudo_mask.squeeze(1), query_input.masks[:1, ...].squeeze(0))
+
+        # loss on unlabelled frames: pseudo mask prompt vs. true mask prompt
+        valid_batch = query_input.find_valid_batch
+        consistency_loss = self._compute_consistency_loss(previous_stages_out_pseudo, previous_stages_out_real, valid_batch)
+
+        return previous_stages_out_pseudo, query_input.masks, valid_batch, coarse_loss, consistency_loss
+
+    def _pseudo_forward(self, support_input: BatchedVideoDatapoint, query_input: BatchedVideoDatapoint, backbone_out):
         # Generate embedded memory for support
         current_out = self._support_memory_encoder(support_input)
         query_pseudo_mask = self._generate_query_mask(query_input, current_out)
-
-        if self.training or not self.forward_backbone_per_frame_for_eval:
-            # precompute image features on all frames before tracking
-            backbone_out = self.forward_image(query_input.flat_img_batch)
-        else:
-            # defer image feature computation on a frame until it's being tracked
-            backbone_out = {"backbone_fpn": None, "vision_pos_enc": None}
+        
+        # propagate with pseudo masks
         backbone_out = self.prepare_prompt_inputs(backbone_out, query_input, (query_pseudo_mask > 0))
         previous_stages_out = self.forward_tracking(backbone_out, query_input)
 
-        return previous_stages_out, query_input.masks
+        return previous_stages_out, query_pseudo_mask
+        
+    def _real_forward(self, query_input: BatchedVideoDatapoint, backbone_out):
+        # propagate with real masks
+        backbone_out = self.prepare_prompt_inputs(backbone_out, query_input)
+        previous_stages_out = self.forward_tracking(backbone_out, query_input)
+
+        # clean memory
+        previous_stages_out = self._cleanup_stages(previous_stages_out)
+
+        return previous_stages_out
+
+    def _compute_coarse_loss(self, logit_mask, gt_mask, coarse_weight=5):
+        """ BCE + Dice loss"""
+        bsz = logit_mask.size(0)
+        loss_bce = self.bce_with_logits_loss(logit_mask.squeeze(1), gt_mask.float())
+        loss_dice = dice_loss(logit_mask, gt_mask, bsz)
+        return coarse_weight * (loss_bce + loss_dice)
+    
+    def _compute_consistency_loss(self, pseudo_outputs, real_output, valid_batch: torch.Tensor):
+        loss_con = 0.
+        consistency_weight = get_consistency_weight(self.ep, consistency=5, rampup_length=5000)
+        for pseudo_outs, real_outs, valid in zip(pseudo_outputs, real_output, valid_batch):
+            pseudo_src_list = pseudo_outs["multistep_pred_multimasks_high_res"]
+            real_src_list = real_outs["multistep_pred_multimasks_high_res"]
+            for pseudo_src, real_src in zip(pseudo_src_list, real_src_list):
+                pseudo_src = pseudo_src.mean(dim=1).squeeze()
+                real_src = real_src.mean(dim=1).squeeze().to(pseudo_src.device) 
+                loss_con += consistency_weight * self.mse_loss(pseudo_src * (~valid[:, None, None]), 
+                                                               real_src * (~valid[:, None, None]))
+
+        self.ep += 1
+        return loss_con
+
+    def _cleanup_stages(self, previous_stages_out):
+        for frame_out in previous_stages_out:
+            # final masks: pseudo = keep grad, real = detach + cpu
+            frame_out["pred_masks"] = frame_out["pred_masks"].detach().cpu()
+            frame_out["pred_masks_high_res"] = frame_out["pred_masks_high_res"].detach().cpu()
+
+            for k in [
+                "multistep_pred_multimasks_high_res",
+                "multistep_pred_multimasks",
+                "multistep_pred_masks",
+                "multistep_pred_masks_high_res",
+            ]:
+                if k in frame_out and frame_out[k] is not None:
+                    frame_out[k] = [x.detach().cpu() for x in frame_out[k]]
+
+        return previous_stages_out
 
     def _support_memory_encoder(self, support_input: BatchedVideoDatapoint):
         """
@@ -248,7 +348,7 @@ class SAM2Train(SAM2Base):
 
         return image, vision_feats, vision_pos_embeds, feat_sizes
 
-    def prepare_prompt_inputs(self, backbone_out, input, query_pseudo_mask, start_frame_idx=0):
+    def prepare_prompt_inputs(self, backbone_out, input, query_pseudo_mask=None, start_frame_idx=0):
         """
         Prepare input mask, point or box prompts. Optionally, we allow tracking from
         a custom `start_frame_idx` to the end of the video (for evaluation purposes).
@@ -327,20 +427,21 @@ class SAM2Train(SAM2Base):
         backbone_out["mask_inputs_per_frame"] = {}  # {frame_idx: <input_masks>}
         backbone_out["point_inputs_per_frame"] = {}  # {frame_idx: <input_points>}
         for t in init_cond_frames:
+            mask_input = query_pseudo_mask if query_pseudo_mask is not None else gt_masks_per_frame[t]
             if not use_pt_input:
-                backbone_out["mask_inputs_per_frame"][t] = query_pseudo_mask
+                backbone_out["mask_inputs_per_frame"][t] = mask_input
             else:
                 # During training # P(box) = prob_to_use_pt_input * prob_to_use_box_input
                 use_box_input = self.rng.random() < prob_to_use_box_input
                 if use_box_input:
                     points, labels = sample_box_points(
-                        query_pseudo_mask,
+                        mask_input,
                     )
                 else:
                     # (here we only sample **one initial point** on initial conditioning frames from the
                     # ground-truth mask; we may sample more correction points on the fly)
                     points, labels = get_next_point(
-                        gt_masks=query_pseudo_mask,
+                        gt_masks=mask_input,
                         pred_masks=None,
                         method=(
                             "uniform" if self.training else self.pt_sampling_for_eval
@@ -661,6 +762,7 @@ def split_support(input: BatchedVideoDatapoint):
     support_img  = input.img_batch[sup]          # [1, B, C, H, W]
     support_obj  = input.obj_to_frame_idx[sup]   # [1, O, 2]
     support_mask = input.masks[sup]              # [1, O, H, W]
+    support_valid = input.valid_frame_idx_batch[sup]
     support_meta = BatchedVideoMetaData(
         unique_objects_identifier=input.metadata.unique_objects_identifier[sup],
         frame_orig_size=input.metadata.frame_orig_size[sup],
@@ -670,6 +772,7 @@ def split_support(input: BatchedVideoDatapoint):
         obj_to_frame_idx=support_obj,
         masks=support_mask,
         metadata=support_meta,
+        valid_frame_idx_batch=support_valid,
         dict_key=input.dict_key,
         batch_size=[1],
     )
@@ -678,6 +781,7 @@ def split_support(input: BatchedVideoDatapoint):
     query_img  = input.img_batch[qry]            # [Tq, B, C, H, W]
     query_obj  = input.obj_to_frame_idx[qry].clone()
     query_mask = input.masks[qry]                # [Tq, O, H, W]
+    query_valid = input.valid_frame_idx_batch[qry]
     query_meta = BatchedVideoMetaData(
         unique_objects_identifier=input.metadata.unique_objects_identifier[qry].clone(),
         frame_orig_size=input.metadata.frame_orig_size[qry],
@@ -697,6 +801,7 @@ def split_support(input: BatchedVideoDatapoint):
         obj_to_frame_idx=query_obj,
         masks=query_mask,
         metadata=query_meta,
+        valid_frame_idx_batch=query_valid,
         dict_key=input.dict_key,
         batch_size=[query_img.shape[0]],  # Tq
     )

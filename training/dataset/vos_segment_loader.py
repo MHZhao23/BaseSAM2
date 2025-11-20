@@ -125,6 +125,9 @@ class PalettisedPNGSegmentLoader:
         Return:
             binary_segments: dict
         """
+        if not self.frame_id_to_png_filename.get(frame_id, None):
+            return None
+        
         # check the path
         mask_path = os.path.join(
             self.video_png_root, self.frame_id_to_png_filename[frame_id]

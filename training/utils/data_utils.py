@@ -41,6 +41,7 @@ class BatchedVideoDatapoint:
         obj_to_frame_idx: A [TxOx2] tensor containing the image_batch index which the object belongs to. O is the number of objects in the batch.
         masks: A [TxOxHxW] tensor containing binary masks for each object in the batch.
         metadata: An instance of BatchedVideoMetaData containing metadata about the batch.
+        valid_frame_idx_batch: a [TxB] tensor indicating which frames have corresponding masks
         dict_key: A string key used to identify the batch.
     """
 
@@ -48,6 +49,7 @@ class BatchedVideoDatapoint:
     obj_to_frame_idx: torch.IntTensor
     masks: torch.BoolTensor
     metadata: BatchedVideoMetaData
+    valid_frame_idx_batch: torch.BoolTensor
 
     dict_key: str
 
@@ -86,6 +88,19 @@ class BatchedVideoDatapoint:
 
         return self.img_batch.transpose(0, 1).flatten(0, 1)
 
+    @property
+    def find_valid_batch(self) -> torch.BoolTensor:
+        """
+        Return a tensor of shape [T*N] indicating labelled frames and masks 
+        N means all videos in this batch extended by the class number
+        """
+        Tq = self.batch_size[0]
+        valid_batch = self.valid_frame_idx_batch
+        index = (self.flat_obj_to_img_idx[:1, ...] // Tq).squeeze(0).long()
+        valid_batch = valid_batch[:, index]
+        
+        return valid_batch
+
 
 @dataclass
 class Object:
@@ -107,7 +122,7 @@ class VideoDatapoint:
     """Refers to an image/video and all its annotations"""
 
     frames: List[Frame]
-    # sup_frame: Tuple[PILImage.Image, torch.Tensor]
+    valid_frame_id: List[int]
     video_id: int
     size: Tuple[int, int]
 
@@ -135,10 +150,12 @@ def collate_fn(
     step_t_obj_to_frame_idx = [
         [] for _ in range(T)
     ]  # List to store frame indices for each time step
+    valid_frame_idx = torch.zeros((T, len(batch))).to(torch.bool)
 
     for video_idx, video in enumerate(batch):
         orig_video_id = video.video_id
         orig_frame_size = video.size
+        valid_frame_idx[:, video_idx][video.valid_frame_id] = True
         for t, frame in enumerate(video.frames):
             objects = frame.objects
             for obj in objects:
@@ -175,6 +192,7 @@ def collate_fn(
             unique_objects_identifier=objects_identifier,
             frame_orig_size=frame_orig_size,
         ),
+        valid_frame_idx_batch=valid_frame_idx,
         dict_key=dict_key,
         batch_size=[T],
     )

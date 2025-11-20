@@ -164,7 +164,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
         self.iou_use_l1_loss = iou_use_l1_loss
         self.pred_obj_scores = pred_obj_scores
 
-    def forward(self, outs_batch: List[Dict], targets_batch: torch.Tensor):
+    def forward(self, outs_batch: List[Dict], targets_batch: torch.Tensor, valid_batch: torch.Tensor):
         assert len(outs_batch) == len(targets_batch)
         num_objects = torch.tensor(
             (targets_batch.shape[1]), device=targets_batch.device, dtype=torch.float
@@ -174,14 +174,14 @@ class MultiStepMultiMasksAndIous(nn.Module):
         num_objects = torch.clamp(num_objects / get_world_size(), min=1).item()
 
         losses = defaultdict(int)
-        for outs, targets in zip(outs_batch, targets_batch):
-            cur_losses = self._forward(outs, targets, num_objects)
+        for outs, targets, valid in zip(outs_batch, targets_batch, valid_batch):
+            cur_losses = self._forward(outs, targets, valid, num_objects)
             for k, v in cur_losses.items():
                 losses[k] += v
 
         return losses
 
-    def _forward(self, outputs: Dict, targets: torch.Tensor, num_objects):
+    def _forward(self, outputs: Dict, targets: torch.Tensor, valid: torch.Tensor, num_objects):
         """
         Compute the losses related to the masks: the focal loss and the dice loss.
         and also the MAE or MSE loss between predicted IoUs and actual IoUs.
@@ -210,7 +210,8 @@ class MultiStepMultiMasksAndIous(nn.Module):
             src_masks_list, ious_list, object_score_logits_list
         ):
             self._update_losses(
-                losses, src_masks, target_masks, ious, num_objects, object_score_logits
+                losses, src_masks * valid[:, None, None, None], target_masks * valid[:, None, None, None], 
+                ious * valid[:, None], num_objects, object_score_logits * valid[:, None]
             )
         losses[CORE_LOSS_KEY] = self.reduce_loss(losses)
         return losses
